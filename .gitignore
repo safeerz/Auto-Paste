@@ -1,0 +1,26 @@
+# --- Secrets: never commit Google service-account keys or any JSON key files ---
+# The app stores credentials per-user in %APPDATA%\AutoPaster\credentials.json,
+# outside this folder. These rules guard against stray copies landing here.
+*.json
+credentials*.json
+*service-account*.json
+auto-pasting-*.json
+*.pem
+*.p12
+.env
+.env.*
+
+# Local app settings (spreadsheet names/URLs)
+auto_paste_settings.json
+
+# PyInstaller output (older builds embedded the key inside the exe)
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+*.bak
+.vscode/
