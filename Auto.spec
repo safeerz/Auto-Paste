@@ -5,7 +5,7 @@ a = Analysis(
     ['Auto.py'],
     pathex=[],
     binaries=[],
-    datas=[],  # never bundle the credentials key; the app asks for it on first run
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -29,7 +29,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
