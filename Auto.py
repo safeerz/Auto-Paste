@@ -1,3 +1,5 @@
+SCURRENT_VERSION = "v1.0.0"
+GITHUB_REPO = "safeerz/Auto-Paste"  # Replace with your actual username/repo
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 import threading
