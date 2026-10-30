@@ -1,5 +1,3 @@
-SCURRENT_VERSION = "v1.0.0"
-GITHUB_REPO = "safeerz/Auto-Paste"  # Replace with your actual username/repo
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 import threading
@@ -9,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import webbrowser
 import requests
 import pyperclip
@@ -18,7 +17,7 @@ from pynput import mouse
 # === CONFIGURATION (defaults — all editable in the UI) ===
 APP_NAME = "AutoPaster"
 CURRENT_VERSION = "v1.0.0"                 # bump this (and the GitHub release tag) for each release
-GITHUB_REPO = "username/repository"        # TODO: your public GitHub repo as "owner/repo"
+GITHUB_REPO = "safeerz/Auto-Paste"        # public GitHub repo as "owner/repo"
 CREDENTIALS_FILENAME = "credentials.json"
 SETTINGS_FILENAME = "auto_paste_settings.json"
 REQUIRED_CREDENTIAL_KEYS = ("type", "project_id", "private_key", "client_email", "token_uri")
@@ -355,7 +354,7 @@ class CredentialsDialog:
 
 
 # =========================
-# Check for Updates (GitHub Releases)
+# Check for Updates (GitHub Releases) & In-Place Self Updater
 # =========================
 _update_check_running = False
 
@@ -367,8 +366,270 @@ def parse_version(tag):
     return tuple(nums + [0] * (3 - len(nums)))
 
 
-def check_for_updates(parent=None):
-    """Ask GitHub for the latest release and offer to download it if it's newer.
+def apply_update_and_restart(target_exe, new_exe, parent=None, app=None):
+    """Replace target_exe with new_exe using a detached background updater, then restart."""
+    if not os.path.isfile(new_exe):
+        messagebox.showerror("Update Error", "Downloaded update file was not found.", parent=parent)
+        return
+
+    pid = os.getpid()
+
+    if sys.platform == "win32":
+        ps_code = f"""# AutoPaster In-Place Updater
+param(
+    [Parameter(Mandatory=$true)][int]$ProcessId,
+    [Parameter(Mandatory=$true)][string]$TargetExe,
+    [Parameter(Mandatory=$true)][string]$NewExe
+)
+
+# 1. Wait for parent process to exit
+try {{
+    Wait-Process -Id $ProcessId -Timeout 20 -ErrorAction SilentlyContinue
+}} catch {{}}
+
+Start-Sleep -Milliseconds 600
+
+# 2. Overwrite target executable with retry loop
+$replaced = $false
+for ($i = 0; $i -lt 15; $i++) {{
+    try {{
+        Move-Item -LiteralPath $NewExe -Destination $TargetExe -Force -ErrorAction Stop
+        $replaced = $true
+        break
+    }} catch {{
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+
+# 3. If access was denied, attempt elevated move
+if (-not $replaced) {{
+    try {{
+        $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"Move-Item -LiteralPath '$NewExe' -Destination '$TargetExe' -Force; Start-Process -FilePath '$TargetExe'`""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $arg -WindowStyle Hidden
+        $replaced = $true
+    }} catch {{}}
+}}
+
+# 4. Restart the updated application
+if ($replaced) {{
+    try {{
+        Start-Process -FilePath $TargetExe
+    }} catch {{}}
+}}
+
+# 5. Clean up updater script
+try {{
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}} catch {{}}
+"""
+        ps_script = os.path.join(tempfile.gettempdir(), f"autopaster_update_{pid}.ps1")
+        try:
+            with open(ps_script, "w", encoding="utf-8") as f:
+                f.write(ps_code)
+
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-WindowStyle", "Hidden",
+                    "-File", ps_script,
+                    "-ProcessId", str(pid),
+                    "-TargetExe", target_exe,
+                    "-NewExe", new_exe,
+                ],
+                creationflags=creationflags,
+                close_fds=True,
+            )
+        except Exception as e:
+            messagebox.showerror("Update Error", f"Failed to start updater:\n{e}", parent=parent)
+            return
+    else:
+        # Unix fallback
+        try:
+            os.replace(new_exe, target_exe)
+            os.chmod(target_exe, 0o755)
+            subprocess.Popen([target_exe])
+        except Exception as e:
+            messagebox.showerror("Update Error", f"Failed to replace executable:\n{e}", parent=parent)
+            return
+
+    # Shutdown current application
+    if app:
+        try:
+            app.on_close()
+        except Exception:
+            pass
+    elif parent:
+        try:
+            parent.destroy()
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+class UpdateDownloadDialog:
+    """Modal dialog displaying download progress and applying the update in-place."""
+
+    def __init__(self, parent, download_url, target_exe, new_version, app=None):
+        self.parent = parent
+        self.download_url = download_url
+        self.target_exe = target_exe
+        self.new_version = new_version
+        self.app = app
+        self.cancelled = False
+
+        # Use same directory as target_exe if writable, otherwise use temp directory
+        target_dir = os.path.dirname(self.target_exe) or app_dir()
+        use_temp_dir = False
+        try:
+            test_path = os.path.join(target_dir, f".write_test_{int(time.time())}")
+            with open(test_path, "w") as f:
+                f.write("ok")
+            os.remove(test_path)
+        except OSError:
+            use_temp_dir = True
+
+        if use_temp_dir:
+            self.temp_file = os.path.join(tempfile.gettempdir(), f"AutoPaster_update_{int(time.time())}.exe")
+        else:
+            self.temp_file = os.path.join(target_dir, f"AutoPaster_update_{int(time.time())}.exe")
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("AutoPaster Update")
+        self.win.geometry("420x170")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        # Center dialog relative to parent
+        self.win.update_idletasks()
+        try:
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            w, h = 420, 170
+            x = px + max(0, (pw - w) // 2)
+            y = py + max(0, (ph - h) // 2)
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+        pad_frame = ttk.Frame(self.win, padding=16)
+        pad_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(pad_frame, text=f"Downloading {APP_NAME} {self.new_version}...",
+                  font=("Arial", 10, "bold")).pack(anchor="w", pady=(0, 10))
+
+        self.progress_bar = ttk.Progressbar(pad_frame, orient="horizontal", mode="determinate", maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(0, 6))
+
+        self.status_label = ttk.Label(pad_frame, text="Connecting to GitHub...", foreground="#555555")
+        self.status_label.pack(anchor="w", pady=(0, 12))
+
+        btn_row = ttk.Frame(pad_frame)
+        btn_row.pack(fill=tk.X)
+        self.btn_cancel = ttk.Button(btn_row, text="Cancel", command=self.cancel)
+        self.btn_cancel.pack(side=tk.RIGHT)
+
+        self.win.grab_set()
+        self.start_download()
+
+    def start_download(self):
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _cleanup_temp(self):
+        if self.temp_file and os.path.isfile(self.temp_file):
+            try:
+                os.remove(self.temp_file)
+            except OSError:
+                pass
+
+    def cancel(self):
+        self.cancelled = True
+        self.status_label.config(text="Cancelling...")
+        self.btn_cancel.config(state="disabled")
+        self._cleanup_temp()
+        self.win.destroy()
+
+    def _update_ui(self, percent, text):
+        if self.cancelled or not self.win.winfo_exists():
+            return
+        if percent is not None:
+            self.progress_bar["value"] = percent
+        self.status_label.config(text=text)
+
+    def _download_worker(self):
+        try:
+            with requests.get(self.download_url, stream=True, timeout=25, headers={
+                "User-Agent": f"{APP_NAME}/{CURRENT_VERSION}",
+                "Accept": "application/octet-stream",
+            }) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                chunk_size = 65536
+
+                with open(self.temp_file, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if self.cancelled:
+                            break
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = (downloaded / total) * 100
+                                mb_cur = downloaded / (1024 * 1024)
+                                mb_tot = total / (1024 * 1024)
+                                msg = f"{mb_cur:.1f} MB / {mb_tot:.1f} MB ({int(pct)}%)"
+                            else:
+                                mb_cur = downloaded / (1024 * 1024)
+                                msg = f"{mb_cur:.1f} MB downloaded"
+                                pct = None
+                            self.win.after(0, self._update_ui, pct, msg)
+
+            if self.cancelled:
+                self._cleanup_temp()
+                return
+
+            self.win.after(0, self._on_complete)
+
+        except Exception as e:
+            self._cleanup_temp()
+            if not self.cancelled:
+                self.win.after(0, self._on_error, str(e))
+
+    def _on_error(self, err_msg):
+        if self.win.winfo_exists():
+            self.win.destroy()
+        messagebox.showerror("Update Failed", f"Could not download update:\n{err_msg}", parent=self.parent)
+
+    def _on_complete(self):
+        if self.cancelled or not self.win.winfo_exists():
+            return
+        self.win.destroy()
+
+        if getattr(sys, "frozen", False):
+            # In compiled exe mode: replace running executable and restart
+            apply_update_and_restart(self.target_exe, self.temp_file, parent=self.parent, app=self.app)
+        else:
+            # In script development mode: update the target executable directly
+            try:
+                if os.path.isfile(self.target_exe):
+                    try:
+                        os.remove(self.target_exe)
+                    except OSError:
+                        pass
+                os.replace(self.temp_file, self.target_exe)
+                messagebox.showinfo("Update Complete",
+                                    f"Successfully updated Auto.exe to {self.new_version}!\n\n"
+                                    f"Location: {self.target_exe}", parent=self.parent)
+            except Exception as e:
+                messagebox.showerror("Update Error", f"Could not replace executable:\n{e}", parent=self.parent)
+
+
+def check_for_updates(parent=None, app=None):
+    """Ask GitHub for the latest release and offer to download and apply it in-place.
     The network call runs in a background thread so the window never freezes."""
     global _update_check_running
     parent = parent or tk._default_root
@@ -414,10 +675,11 @@ def check_for_updates(parent=None):
                                 parent=parent)
             return
 
-        # Prefer a direct .exe download from the release assets, else the release page
-        exe_url = next((a.get("browser_download_url") for a in payload.get("assets", [])
-                        if a.get("name", "").lower().endswith(".exe")), None)
-        download_url = exe_url or payload.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+        # Look for .exe asset in the release assets
+        exe_asset = next((a for a in payload.get("assets", [])
+                          if a.get("name", "").lower().endswith(".exe")), None)
+        exe_url = exe_asset.get("browser_download_url") if exe_asset else None
+        html_url = payload.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
 
         notes = (payload.get("body") or "").strip()
         if len(notes) > 400:
@@ -425,11 +687,28 @@ def check_for_updates(parent=None):
         message = f"A new version is available!\n\nInstalled: {CURRENT_VERSION}\nLatest: {latest}\n"
         if notes:
             message += f"\nWhat's new:\n{notes}\n"
-        message += "\nDownload it now?" if exe_url else "\nOpen the release page to download it?"
 
-        if messagebox.askyesno("Update Available", message, parent=parent):
-            if download_url.startswith("https://"):
-                webbrowser.open(download_url)
+        if not exe_url:
+            message += "\nOpen the release page in your browser?"
+            if messagebox.askyesno("Update Available", message, parent=parent):
+                webbrowser.open(html_url)
+            return
+
+        message += "\nWould you like to update now?\nAutoPaster will download the update and restart automatically."
+        if not messagebox.askyesno("Update Available", message, parent=parent):
+            return
+
+        # Target executable to update
+        if getattr(sys, "frozen", False):
+            target_exe = os.path.abspath(sys.executable)
+        else:
+            # Script development mode: target dist/Auto.exe or local Auto.exe
+            dist_exe = os.path.abspath(os.path.join(app_dir(), "dist", "Auto.exe"))
+            local_exe = os.path.abspath(os.path.join(app_dir(), "Auto.exe"))
+            target_exe = dist_exe if os.path.isfile(dist_exe) else local_exe
+
+        # Open download progress modal dialog
+        UpdateDownloadDialog(parent, exe_url, target_exe, latest, app=app)
 
     threading.Thread(target=fetch, daemon=True).start()
 
@@ -568,7 +847,7 @@ class AutoPasterApp:
         self.btn_stop.pack(side=tk.LEFT, padx=10)
 
         self.btn_update = tk.Button(btn_frame, text="Check for Updates",
-                                    command=lambda: check_for_updates(self.root))
+                                    command=lambda: check_for_updates(self.root, self))
         self.btn_update.pack(side=tk.LEFT, padx=10)
 
         self.log_area = scrolledtext.ScrolledText(root, width=66, height=14, state='disabled')
